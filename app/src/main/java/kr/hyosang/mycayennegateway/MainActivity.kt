@@ -1,33 +1,35 @@
 package kr.hyosang.mycayennegateway
 
 import android.Manifest
-import android.annotation.TargetApi
 import android.app.Activity
 import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.content.*
-import android.database.DataSetObserver
 import android.os.*
 import android.util.Log
 import android.view.View
-import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import kotlinx.android.synthetic.main.activity_main.*
 import kr.hyosang.mycayennegateway.service.CayenneService
-import java.security.Permissions
 
 class MainActivity : Activity() {
     private var serviceMessenger: Messenger? = null
     private var bluetoothDiscoveryList: ArrayAdapter<String>? = null
 
+    private var pairingButton: View? = null
+
     private val appMessenger = Messenger(Handler( { message: Message ->
         when(message.what) {
             CayenneService.MSG_GET_TEMPHUMI_MAC_1 ->
-                txtTempHumi1MAC.text = message.obj as String
+                if(message.obj != null) {
+                    txtTempHumi1MAC.text = message.obj as String
+                }
 
             CayenneService.MSG_GET_TEMPHUMI_SUMMARY_1 ->
-                txtTempHumi1Value.text = message.obj as String
+                if(message.obj != null) {
+                    txtTempHumi1Value.text = message.obj as String
+                }
         }
 
 
@@ -43,7 +45,13 @@ class MainActivity : Activity() {
         val intent = Intent(this, CayenneService::class.java)
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
 
-        btnPairing.setOnClickListener {
+        btnPairing1.setOnClickListener {
+            pairingButton = it
+            startPairing()
+        }
+
+        btnPairing2.setOnClickListener {
+            pairingButton = it
             startPairing()
         }
 
@@ -82,7 +90,14 @@ class MainActivity : Activity() {
                     Log.i("TEST", "Address: $addr")
 
                     val msg = Message.obtain()
-                    msg.what = CayenneService.MSG_SET_TEMPHUMI_MAC_1
+                    if(pairingButton?.id == R.id.btnPairing1) {
+                        msg.what = CayenneService.MSG_SET_TEMPHUMI_MAC_1
+                    }else if(pairingButton?.id == R.id.btnPairing2) {
+                        msg.what = CayenneService.MSG_SET_POWER_MAC
+                    }else {
+                        return@setAdapter
+                    }
+
                     msg.obj = addr
                     msg.replyTo = appMessenger
                     serviceMessenger?.send(msg)
@@ -116,7 +131,9 @@ class MainActivity : Activity() {
             }else if(BluetoothDevice.ACTION_FOUND.equals(action)) {
                 val device = p1?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as BluetoothDevice
 
-                if(device.address.startsWith("4C:65:A8")) {
+                if(device.address.startsWith("4C:65:A8")) {     // Xiaomi
+                    bluetoothDiscoveryList?.add(device.address)
+                }else if(device.address.startsWith("04:32:F4")) { // 스마트분전함
                     bluetoothDiscoveryList?.add(device.address)
                 }
 

@@ -9,6 +9,8 @@ import android.util.Log
 import org.eclipse.paho.android.service.MqttAndroidClient
 import org.eclipse.paho.client.mqttv3.*
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.charset.Charset
 import java.util.*
 import java.util.regex.Pattern
@@ -17,15 +19,19 @@ class CayenneService : Service() {
     companion object {
         var TAG: String = "CayenneService"
 
-        var KEY_TEMPHUMI_MAC_1 = "temphumi_device_mac_1"
+        val KEY_TEMPHUMI_MAC_1 = "temphumi_device_mac_1"
+        val KEY_POWER_MAC = "power_device_mac"
 
         val MSG_SET_TEMPHUMI_MAC_1 = 0x01
         val MSG_GET_TEMPHUMI_MAC_1 = 0x02
         val MSG_GET_TEMPHUMI_SUMMARY_1 = 0x03
 
+        val MSG_SET_POWER_MAC = 0x10
+
     }
 
     private var temphumiRunner1: TempHumiRunner? = null
+    private var powerRunner: PowerRunner? = null
 
     private var messenger = Messenger(Handler( {message: Message ->
         when(message.what) {
@@ -44,6 +50,8 @@ class CayenneService : Service() {
                 reply.obj = temphumiRunner1?.getSummary()
                 message.replyTo.send(reply)
             }
+
+            MSG_SET_POWER_MAC -> updatePowerMAC(message.obj as String)
         }
 
         true
@@ -71,10 +79,16 @@ class CayenneService : Service() {
 
     private fun startSavedDevices() {
         val pref = getSharedPreferences("service", Context.MODE_PRIVATE)
-        if(pref.contains(KEY_TEMPHUMI_MAC_1)) {
+        if(pref.contains(KEY_TEMPHUMI_MAC_1) && (temphumiRunner1 == null)) {
             val mac = pref.getString(KEY_TEMPHUMI_MAC_1, "")
             temphumiRunner1 = TempHumiRunner(this, mac, "a5d6d530-88dd-11e8-b98d-6b2426cc1856", "e74aef70-7b53-11e8-99f5-3323ff570d09")
             temphumiRunner1?.start()
+        }
+
+        if(pref.contains(KEY_POWER_MAC) && (powerRunner == null)) {
+            val mac = pref.getString(KEY_POWER_MAC, "")
+            powerRunner = PowerRunner(this, mac, "63765a20-8f4b-11e8-9d44-05130b528c6a")
+            powerRunner?.start()
         }
     }
 
@@ -84,9 +98,216 @@ class CayenneService : Service() {
         editor.putString(KEY_TEMPHUMI_MAC_1, mac)
         editor.commit()
 
-        temphumiRunner1 = TempHumiRunner(this, mac, "a5d6d530-88dd-11e8-b98d-6b2426cc1856", "e74aef70-7b53-11e8-99f5-3323ff570d09")
-        temphumiRunner1?.start()
+        startSavedDevices()
     }
+
+    private fun updatePowerMAC(mac: String) {
+        val pref = getSharedPreferences("service", Context.MODE_PRIVATE)
+        val editor = pref.edit()
+        editor.putString(KEY_POWER_MAC, mac)
+        editor.commit()
+
+        startSavedDevices()
+    }
+}
+
+class PowerRunner(context: Context, device: String, cayenneClientID: String) : Thread() {
+    private val context = context.applicationContext
+    private val deviceAddress = device
+    private val cayenneClientID = cayenneClientID
+
+    private var outputStream: OutputStream? = null
+    private var reader: ReaderThread? = null
+
+    private var lastRead = System.currentTimeMillis()
+
+    private var lockObj = java.lang.Object()
+    private var sendCommands = ArrayList<String>()
+
+
+    private val persistence = MemoryPersistence()
+    private var mqttClient = MqttAndroidClient(context, "tcp://mqtt.mydevices.com:1883", cayenneClientID, persistence)
+
+
+
+    private var currentWatt: Double = 0.0
+    private var accrueWatt: Double = 0.0
+    private var voltage: Double = 0.0
+    private var current: Double = 0.0
+
+    override fun run() {
+        val device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(deviceAddress)
+        val socket = device.createInsecureRfcommSocketToServiceRecord(UUID.fromString("00001101-0000-1000-8000-00805F9B34FB"))
+
+        socket.connect()
+
+        reader = ReaderThread(socket.inputStream)
+        reader?.start()
+
+        outputStream = socket.outputStream
+
+        while(true) {
+            if(!mqttClient?.isConnected) {
+                connectMqtt()
+            }
+
+            sendCommands.add("_rb0_")
+            sendCommands.add("_rf0_")
+            sendCommands.add("_rc0_")
+            sendCommands.add("_rd0_")
+
+            sendNextCommand()
+
+            synchronized(lockObj) {
+                lockObj.wait()
+            }
+
+            publishData()
+
+            Thread.sleep(5000)
+        }
+    }
+
+    private fun sendNextCommand() {
+        if(sendCommands.count() > 0) {
+            val c = sendCommands.first().toByteArray(Charset.forName("US-ASCII"))
+            c[0] = 2
+            c[c.lastIndex] = 3
+
+            outputStream?.write(c)
+
+            sendCommands.removeAt(0)
+        }else {
+            synchronized(lockObj) {
+                lockObj.notifyAll()
+            }
+        }
+    }
+
+    private fun connectMqtt() {
+        Log.d("TEST", "Reconnect MQTT...")
+
+        val options = MqttConnectOptions()
+        options.userName = "e74aef70-7b53-11e8-99f5-3323ff570d09"
+        options.password = "af8f8c5b73a0f8271378e7105d53aaf0dc609b4c".toCharArray()
+
+        mqttClient.connect(options, null, mqttListener)
+    }
+
+
+    private val mqttListener = object: IMqttActionListener {
+        override fun onSuccess(asyncActionToken: IMqttToken?) {
+            Log.i("TEST", "MQTT Connected")
+        }
+
+        override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
+            Log.e("TEST", "Failur: $exception")
+        }
+
+    }
+
+    inner class ReaderThread(inputStream: InputStream) : Thread() {
+        val inputStream = inputStream
+        val buf: ByteArray = ByteArray(256)
+        val cmdBuf = ByteArray(256)
+        var copyIdx = 0
+
+        override fun run() {
+            var read = 0
+            var needLen = 0
+
+            while(true) {
+                try {
+                    read = inputStream.read(buf)
+                    if(read > 0) {
+                        //append
+                        System.arraycopy(buf, 0, cmdBuf, copyIdx, read)
+                        copyIdx += read
+
+                        processCommand()
+                    }else {
+                        Log.d("TEST", "NO READ")
+                        break
+                    }
+                }catch(e: Exception) {
+                    Log.w("TEST", Log.getStackTraceString(e))
+                }
+            }
+
+        }
+
+        private fun processCommand() {
+            if(copyIdx >= 4) {
+                if (cmdBuf[0].toInt() == 2) {
+                    val cmd = String(cmdBuf, 1, 2)
+                    val len = cmdBuf[3].toInt() - '0'.toInt()
+                    val push = 4 + len + 1
+
+                    if(copyIdx >= push) {
+                        val data = String(cmdBuf, 4, len)
+
+                        Log.d("TEST", "Cmd=$cmd, len=$len, data=$data")
+
+                        System.arraycopy(cmdBuf, push, cmdBuf, 0, (copyIdx - push))
+                        copyIdx -= push
+
+                        command(cmd, data)
+
+                        sendNextCommand()
+                    }
+                }
+            }
+        }
+
+        private fun command(command: String, data: String) {
+            when (command) {
+                "RB" -> //current watt
+                {
+                    currentWatt = data.toInt(10).toFloat() / 1000.0
+                    Log.d("TEST", "Watt = $currentWatt")
+                }
+
+                "RF" -> //monthly accrue
+                {
+                    accrueWatt = data.toInt(10).toFloat() / 100000.0
+                    Log.d("TEST", "Monthly = $accrueWatt")
+                }
+
+                "RC" -> //voltage
+                {
+                    voltage = data.toInt(10).toFloat() / 1000.0
+                    Log.d("TEST", "Voltage = $voltage")
+                }
+
+                "RD" -> //current
+                {
+                    current = data.toInt(10).toFloat() / 1000.0
+                    Log.d("TEST", "Current = $current")
+                }
+            }
+        }
+
+    }
+
+    private fun publishData() {
+        val topic1 = "v1/e74aef70-7b53-11e8-99f5-3323ff570d09/things/$cayenneClientID/data/0"
+        val message1 = "pow,w=$currentWatt"
+        mqttClient.publish(topic1, MqttMessage(message1.toByteArray(Charset.forName("UTF-8"))))
+
+        val topic2 = "v1/e74aef70-7b53-11e8-99f5-3323ff570d09/things/$cayenneClientID/data/1"
+        val message2 = "voltage,v=$voltage"
+        mqttClient.publish(topic2, MqttMessage(message2.toByteArray(Charset.forName("UTF-8"))))
+
+        val topic3 = "v1/e74aef70-7b53-11e8-99f5-3323ff570d09/things/$cayenneClientID/data/2"
+        val message3 = "energy,kwh=$accrueWatt"
+        mqttClient.publish(topic3, MqttMessage(message3.toByteArray(Charset.forName("UTF-8"))))
+
+        val topic4 = "v1/e74aef70-7b53-11e8-99f5-3323ff570d09/things/$cayenneClientID/data/3"
+        val message4 = "current,a=$current"
+        mqttClient.publish(topic4, MqttMessage(message4.toByteArray(Charset.forName("UTF-8"))))
+
+    }
+
 }
 
 class TempHumiRunner(context: Context, device: String, cayenneClientID: String, cayenneMqttUsername: String) {
@@ -132,7 +353,7 @@ class TempHumiRunner(context: Context, device: String, cayenneClientID: String, 
         Log.d("TEST", "Reconnect MQTT...")
 
         val options = MqttConnectOptions()
-        options.userName = "e74aef70-7b53-11e8-99f5-3323ff570d09"
+        options.userName = cayenneMqttUsername
         options.password = "af8f8c5b73a0f8271378e7105d53aaf0dc609b4c".toCharArray()
 
         mqttClient.connect(options, null, mqttListener)
