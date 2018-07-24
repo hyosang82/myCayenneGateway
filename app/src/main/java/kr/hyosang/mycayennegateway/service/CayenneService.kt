@@ -4,7 +4,6 @@ import android.app.Service
 import android.bluetooth.*
 import android.content.Context
 import android.content.Intent
-import android.content.SharedPreferences
 import android.os.*
 import android.util.Log
 import org.eclipse.paho.android.service.MqttAndroidClient
@@ -74,7 +73,7 @@ class CayenneService : Service() {
         val pref = getSharedPreferences("service", Context.MODE_PRIVATE)
         if(pref.contains(KEY_TEMPHUMI_MAC_1)) {
             val mac = pref.getString(KEY_TEMPHUMI_MAC_1, "")
-            temphumiRunner1 = TempHumiRunner(this, mac, "a5d6d530-88dd-11e8-b98d-6b2426cc1856")
+            temphumiRunner1 = TempHumiRunner(this, mac, "a5d6d530-88dd-11e8-b98d-6b2426cc1856", "e74aef70-7b53-11e8-99f5-3323ff570d09")
             temphumiRunner1?.start()
         }
     }
@@ -85,14 +84,17 @@ class CayenneService : Service() {
         editor.putString(KEY_TEMPHUMI_MAC_1, mac)
         editor.commit()
 
-        temphumiRunner1 = TempHumiRunner(this, mac, "a5d6d530-88dd-11e8-b98d-6b2426cc1856")
+        temphumiRunner1 = TempHumiRunner(this, mac, "a5d6d530-88dd-11e8-b98d-6b2426cc1856", "e74aef70-7b53-11e8-99f5-3323ff570d09")
         temphumiRunner1?.start()
     }
 }
 
-class TempHumiRunner(context: Context, device: String, cayenneClientID: String) {
+class TempHumiRunner(context: Context, device: String, cayenneClientID: String, cayenneMqttUsername: String) {
     private val context = context.applicationContext
     private val deviceAddress = device
+
+    private val cayenneMqttUsername = cayenneMqttUsername
+    private val cayenneClientID = cayenneClientID
 
     private val uuidServiceBattry = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
     private val uuidCharacteristicBattery = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
@@ -101,19 +103,21 @@ class TempHumiRunner(context: Context, device: String, cayenneClientID: String) 
     private val uuidCharacteristicTempHumi = UUID.fromString("226caa55-6476-4566-7562-66734470666d")
     private val uuidDescriptorTempHumi = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
+    private val persistence = MemoryPersistence()
+    private var mqttClient = MqttAndroidClient(context, "tcp://mqtt.mydevices.com:1883", cayenneClientID, persistence)
+
     private val arrTemp: ArrayList<Float> = ArrayList()
     private val arrHumi: ArrayList<Float> = ArrayList()
     private var batteryLevel = 0
+    private var lastTemp: Double = 0.0
+    private var lastHumi: Double = 0.0
 
     private var connGatt: BluetoothGatt? = null
-
-    private val persistence = MemoryPersistence()
-    private var mqttClient = MqttAndroidClient(context, "tcp://mqtt.mydevices.com:1883", cayenneClientID, persistence)
 
     private var timer = Timer()
 
     fun start() {
-        timer.schedule(QueryThread(), 0)
+        timer.schedule(HTQueryThread(), 0)
     }
 
     fun getDeviceAddress() : String {
@@ -121,7 +125,7 @@ class TempHumiRunner(context: Context, device: String, cayenneClientID: String) 
     }
 
     fun getSummary() : String {
-        return "T=${arrTemp.average()}, H=${arrHumi.average()}, Batt=$batteryLevel%"
+        return "T=$lastTemp, H=$lastHumi, Batt=$batteryLevel%"
     }
 
     private fun connectMqtt() {
@@ -145,31 +149,7 @@ class TempHumiRunner(context: Context, device: String, cayenneClientID: String) 
 
     }
 
-
-    inner class PublishThread(temp: Float, humi: Float) : Thread() {
-        private var temp = temp
-        private var humi = humi
-
-        override fun run() {
-
-            val topic1 = "v1/e74aef70-7b53-11e8-99f5-3323ff570d09/things/a5d6d530-88dd-11e8-b98d-6b2426cc1856/data/0"
-            val message1 = "batt,p=$batteryLevel"
-            mqttClient.publish(topic1, MqttMessage(message1.toByteArray(Charset.forName("UTF-8"))))
-
-            val topic2 = "v1/e74aef70-7b53-11e8-99f5-3323ff570d09/things/a5d6d530-88dd-11e8-b98d-6b2426cc1856/data/1"
-            val message2 = "temp,c=$temp"
-            mqttClient.publish(topic2, MqttMessage(message2.toByteArray(Charset.forName("UTF-8"))))
-
-            val topic3 = "v1/e74aef70-7b53-11e8-99f5-3323ff570d09/things/a5d6d530-88dd-11e8-b98d-6b2426cc1856/data/2"
-            val message3 = "rel_hum,p=$humi"
-            mqttClient.publish(topic3, MqttMessage(message3.toByteArray(Charset.forName("UTF-8"))))
-
-        }
-
-    }
-
-    inner class QueryThread : TimerTask() {
-
+    inner class HTQueryThread : TimerTask() {
         override fun run() {
             if(connGatt == null) {
                 connGatt = BluetoothAdapter.getDefaultAdapter()
@@ -195,14 +175,13 @@ class TempHumiRunner(context: Context, device: String, cayenneClientID: String) 
 
                     gatt?.discoverServices()
                 }else if(newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    val avgTemp = arrTemp.average()
-                    val avgHumi = arrHumi.average()
+                    lastTemp = arrTemp.average()
+                    lastHumi = arrHumi.average()
 
-                    Log.i("TEST", "Average temp=$avgTemp, humi=$avgHumi")
+                    Log.i("TEST", "Average temp=$lastTemp, humi=$lastHumi")
 
-                    PublishThread(avgTemp.toFloat(), avgHumi.toFloat()).start()
-
-                    Timer().schedule(QueryThread(), 30000)
+                    ReportThread().start()
+                    Timer().schedule(HTQueryThread(), 30000)
                 }
 
             }
@@ -268,6 +247,23 @@ class TempHumiRunner(context: Context, device: String, cayenneClientID: String) 
 
                     Log.d("TEST", "Read value $data")
                 }
+            }
+        }
+
+        inner class ReportThread : Thread() {
+            override fun run() {
+                val topic1 = "v1/$cayenneMqttUsername/things/$cayenneClientID/data/0"
+                val message1 = "batt,p=$batteryLevel"
+                mqttClient.publish(topic1, MqttMessage(message1.toByteArray(Charset.forName("UTF-8"))))
+
+                val topic2 = "v1/$cayenneMqttUsername/things/$cayenneClientID/data/1"
+                val message2 = "temp,c=$lastTemp"
+                mqttClient.publish(topic2, MqttMessage(message2.toByteArray(Charset.forName("UTF-8"))))
+
+                val topic3 = "v1/$cayenneMqttUsername/things/$cayenneClientID/data/2"
+                val message3 = "rel_hum,p=$lastHumi"
+                mqttClient.publish(topic3, MqttMessage(message3.toByteArray(Charset.forName("UTF-8"))))
+
             }
         }
 
